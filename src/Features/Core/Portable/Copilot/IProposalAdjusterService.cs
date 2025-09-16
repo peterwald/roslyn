@@ -6,13 +6,18 @@ using System;
 using System.Collections.Immutable;
 using System.Composition;
 using System.Linq;
+using System.Reflection.Metadata;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Xml.Linq;
 using Microsoft.CodeAnalysis.AddMissingImports;
+using Microsoft.CodeAnalysis.Formatting;
 using Microsoft.CodeAnalysis.Host;
 using Microsoft.CodeAnalysis.Host.Mef;
+using Microsoft.CodeAnalysis.Options;
 using Microsoft.CodeAnalysis.Remote;
 using Microsoft.CodeAnalysis.Shared.Extensions;
+using Microsoft.CodeAnalysis.Shared.TestHooks;
 using Microsoft.CodeAnalysis.Text;
 using Roslyn.Utilities;
 
@@ -35,7 +40,8 @@ internal interface IRemoteCopilotProposalAdjusterService
 [ExportWorkspaceService(typeof(ICopilotProposalAdjusterService), ServiceLayer.Default), Shared]
 [method: ImportingConstructor]
 [method: Obsolete(MefConstruction.ImportingConstructorMessage, error: true)]
-internal sealed class DefaultCopilotProposalAdjusterService() : ICopilotProposalAdjusterService
+internal sealed class DefaultCopilotProposalAdjusterService(
+    IGlobalOptionService globalOptions) : ICopilotProposalAdjusterService
 {
     public async ValueTask<ImmutableArray<TextChange>> TryAdjustProposalAsync(
         Document document, ImmutableArray<TextChange> normalizedChanges, CancellationToken cancellationToken)
@@ -54,18 +60,18 @@ internal sealed class DefaultCopilotProposalAdjusterService() : ICopilotProposal
         }
         else
         {
-            return await TryAdjustProposalInCurrentProcessAsync(
+            return await TryAdjustProposalInCurrentProcessAsync(globalOptions,
                 document, normalizedChanges, cancellationToken).ConfigureAwait(false);
         }
     }
 
     private static async Task<ImmutableArray<TextChange>> TryAdjustProposalInCurrentProcessAsync(
-        Document originalDocument, ImmutableArray<TextChange> normalizedChanges, CancellationToken cancellationToken)
+        IGlobalOptionService globalOptions, Document originalDocument, ImmutableArray<TextChange> normalizedChanges, CancellationToken cancellationToken)
     {
         CopilotUtilities.ThrowIfNotNormalized(normalizedChanges);
 
         // Fork the starting document with the changes copilot wants to make.  Keep track of where the edited spans
-        // move to in the forked doucment, as that is what we will want to analyze.
+        // move to in the forked document, as that is what we will want to analyze.
         var oldText = await originalDocument.GetTextAsync(cancellationToken).ConfigureAwait(false);
 
         var (newText, newSpans) = CopilotUtilities.GetNewTextAndChangedSpans(oldText, normalizedChanges);
@@ -75,17 +81,28 @@ internal sealed class DefaultCopilotProposalAdjusterService() : ICopilotProposal
         var forkedRoot = await forkedDocument.GetRequiredSyntaxRootAsync(cancellationToken).ConfigureAwait(false);
         var totalNewSpan = GetSpanToAnalyze(forkedRoot, newSpans);
 
-        var (success, addImportChanges) = await TryGetAddImportTextChangesAsync(
+        var (addImportSuccess, addImportChanges) = await TryGetAddImportTextChangesAsync(
             originalDocument, forkedDocument, normalizedChanges.First(), totalNewSpan, cancellationToken).ConfigureAwait(false);
-        if (!success)
+
+        (var csharpFormattingSuccess, ImmutableArray<TextChange> afterFormatChanges) = (false, default);
+        if (globalOptions.GetOption(CopilotOptions.FixCodeFormat))
+        {
+            (csharpFormattingSuccess, afterFormatChanges) = await TryGetCSharpFormattingTextChangesAsync(
+                originalDocument, forkedDocument, totalNewSpan, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (!addImportSuccess && !csharpFormattingSuccess)
             return default;
 
         // Keep the new root around, in case something needs it while processing.  This way we don't throw it away unnecessarily.
         GC.KeepAlive(forkedRoot);
 
-        // Reurn the add-import changes concatenated with the original changes.  This way we ensure
+        // Return the add-import changes concatenated with the original changes.  This way we ensure
         // that the copilot changes themselves are not themselves modified by the add-import changes.
-        return addImportChanges.Concat(normalizedChanges);
+        var beforeChanges = addImportChanges.IsDefault ? ImmutableArray<TextChange>.Empty : addImportChanges;
+        var afterChanges = afterFormatChanges.IsDefault ? normalizedChanges : afterFormatChanges;
+
+        return beforeChanges.Concat(afterChanges);
     }
 
     private static async Task<(bool success, ImmutableArray<TextChange> addImportChanges)> TryGetAddImportTextChangesAsync(
@@ -116,6 +133,28 @@ internal sealed class DefaultCopilotProposalAdjusterService() : ICopilotProposal
             return default;
 
         return (true, addImportChanges);
+    }
+
+    private static async Task<(bool success, ImmutableArray<TextChange> afterFormatChanges)> TryGetCSharpFormattingTextChangesAsync(
+        Document originalDocument, Document forkedDocument, TextSpan totalNewSpan, CancellationToken cancellationToken)
+    {
+        var syntaxFormattingService = originalDocument.GetRequiredLanguageService<ISyntaxFormattingService>();
+
+        var formattingOptions = await originalDocument.GetSyntaxFormattingOptionsAsync(cancellationToken).ConfigureAwait(false);
+
+        var forkedRoot = await forkedDocument.GetRequiredSyntaxRootAsync(cancellationToken).ConfigureAwait(false);
+        var formatResult = syntaxFormattingService.GetFormattingResult(forkedRoot, [totalNewSpan], formattingOptions, rules: default, cancellationToken);
+
+        var formattedRoot = formatResult.GetFormattedRoot(cancellationToken);
+        var formattedDocument = forkedDocument.WithSyntaxRoot(formattedRoot);
+
+        var mergedChanges = await formattedDocument.GetTextChangesAsync(originalDocument, cancellationToken).ConfigureAwait(false);
+        var afterFormatChanges = mergedChanges.AsImmutableOrEmpty();
+
+        if (afterFormatChanges.IsEmpty)
+            return default;
+
+        return (true, afterFormatChanges);
     }
 
     private static TextSpan GetSpanToAnalyze(SyntaxNode forkedRoot, ImmutableArray<TextSpan> newSpans)

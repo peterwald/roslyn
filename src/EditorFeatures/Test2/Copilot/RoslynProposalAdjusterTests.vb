@@ -2,8 +2,11 @@
 ' The .NET Foundation licenses this file to you under the MIT license.
 ' See the LICENSE file in the project root for more information.
 
+Imports System.Collections.Immutable
+Imports System.Composition
 Imports System.Threading
 Imports Microsoft.CodeAnalysis.Copilot
+Imports Microsoft.CodeAnalysis.Options
 Imports Microsoft.CodeAnalysis.Text
 Imports Microsoft.CodeAnalysis.VisualBasic
 
@@ -18,8 +21,8 @@ Namespace Microsoft.CodeAnalysis.Editor.UnitTests.Copilot
                 language As String,
                 Optional compilationOptions As CompilationOptions = Nothing) As Task
             Using workspace = If(language Is LanguageNames.CSharp,
-                    EditorTestWorkspace.CreateCSharp(code, compilationOptions:=compilationOptions, composition:=s_composition),
-                    EditorTestWorkspace.CreateVisualBasic(code, compilationOptions:=compilationOptions, composition:=s_composition))
+                        EditorTestWorkspace.CreateCSharp(code, compilationOptions:=compilationOptions, composition:=s_composition),
+                        EditorTestWorkspace.CreateVisualBasic(code, compilationOptions:=compilationOptions, composition:=s_composition))
                 Dim documentId = workspace.Documents.First().Id
                 Dim proposalSpans = workspace.Documents.First().SelectedSpans
 
@@ -27,20 +30,23 @@ Namespace Microsoft.CodeAnalysis.Editor.UnitTests.Copilot
 
                 ' Get the original document without the proposal edit in it.
                 Dim originalDocument = workspace.CurrentSolution.GetDocument(documentId).WithText(
-                    sourceText.WithChanges(proposalSpans.Select(Function(s) New TextChange(s, newText:=""))))
+                        sourceText.WithChanges(proposalSpans.Select(Function(s) New TextChange(s, newText:=""))))
 
                 Dim changes = New List(Of TextChange)()
                 Dim delta = 0
                 For Each selectionSpan In proposalSpans
                     changes.Add(New TextChange(
-                        New TextSpan(selectionSpan.Start + delta, 0), newText:=sourceText.ToString(selectionSpan)))
+                            New TextSpan(selectionSpan.Start + delta, 0), newText:=sourceText.ToString(selectionSpan)))
 
                     delta -= selectionSpan.Length
                 Next
 
+                Dim options = workspace.Services.SolutionServices.GetRequiredService(Of IGlobalOptionService)
+                options.SetGlobalOption(CopilotOptions.FixCodeFormat, True)
+
                 Dim service = workspace.Services.GetRequiredService(Of ICopilotProposalAdjusterService)
                 Dim adjustedChanges = Await service.TryAdjustProposalAsync(
-                    originalDocument, CopilotUtilities.TryNormalizeCopilotTextChanges(changes), CancellationToken.None)
+                        originalDocument, CopilotUtilities.TryNormalizeCopilotTextChanges(changes), CancellationToken.None)
 
                 Dim originalDocumentText = Await originalDocument.GetTextAsync()
                 Dim adjustedDocumentText = originalDocumentText.WithChanges(adjustedChanges)
@@ -202,6 +208,120 @@ class C
 }")
         End Function
 
+        <WpfFact>
+        Public Async Function TestCSharp_RequiresFormatting() As Task
+            Await TestCSharp("
+using System;
+
+class C
+{
+    void M()
+    {
+            [| Console  .  WriteLine ( 1 )   ;|]
+    }
+}", "
+using System;
+
+class C
+{
+    void M()
+    {
+        Console.WriteLine(1);
+    }
+}")
+        End Function
+
+        <WpfFact>
+        Public Async Function TestCSharp_RequiresUsingAndFormatting() As Task
+            Await TestCSharp("
+class C
+{
+    void M()
+    {
+            [| Console  .  WriteLine ( 1 )   ;|]
+    }
+}", "
+using System;
+
+class C
+{
+    void M()
+    {
+        Console.WriteLine(1);
+    }
+}")
+        End Function
+
+        <WpfFact>
+        Public Async Function TestCSharp_Multi_Line_Formatting() As Task
+            Await TestCSharp("
+class C
+{
+    void M()
+    {
+        [| if (false) {
+System.Console  .  WriteLine ( 1 )   ; } |]
+    }
+}", "
+class C
+{
+    void M()
+    {
+        if (false)
+        {
+            System.Console.WriteLine(1);
+        }
+    }
+}")
+        End Function
+
+        <WpfFact>
+        Public Async Function TestCSharp_Formatting_Outside_Proposal() As Task
+            Await TestCSharp("
+class C
+{
+    void M()
+    {
+        [| Console  .  WriteLine ( 1 )   ;|]
+            if (    true    ) {
+            [| Console  .  WriteLine ( 1 )   ;|]
+            }
+    }
+}", "
+using System;
+
+class C
+{
+    void M()
+    {
+        Console.WriteLine(1);
+        if (true)
+        {
+            Console.WriteLine(1);
+        }
+    }
+}")
+        End Function
+
+        <WpfFact>
+        Public Async Function TestCSharp_Partial_Formatting() As Task
+            Await TestCSharp("
+class C
+{
+    void M()
+    {
+        [| System . Console  .  Writ|]
+    }
+}", "
+class C
+{
+    void M()
+    {
+        System.Console.Writ
+    }
+}")
+        End Function
+
 #End Region
 
 #Region "Visual Basic"
@@ -333,6 +453,105 @@ class C
         if (true)
         end if
         Console.WriteLine()
+    end sub
+end class")
+        End Function
+
+        <WpfFact>
+        Public Async Function TestVisualBasic_RequiresFormatting() As Task
+            Await TestVisualBasic("
+Imports System
+
+class C
+    sub M()
+        [| Console . WriteLine ( 1 )   |]
+    end sub
+end class", "
+Imports System
+
+class C
+    sub M()
+        Console.WriteLine(1)
+    end sub
+end class")
+        End Function
+
+        <WpfFact>
+        Public Async Function TestVisualBasic_RequiresUsingAndFormatting() As Task
+            Await TestVisualBasic("
+class C
+    sub M()
+        [| Console . WriteLine ( 1 )   |]
+    end sub
+end class", "
+Imports System
+
+class C
+    sub M()
+        Console.WriteLine(1)
+    end sub
+end class")
+        End Function
+
+        <WpfFact>
+        Public Async Function TestVisualBasic_Multi_Line_Formatting() As Task
+            Await TestVisualBasic("
+class C
+    sub M()
+        [| Console . WriteLine ( 1 )   |]
+        if (false)
+        end if
+        [| Console . WriteLine ( 1 )   |]
+    end sub
+end class
+", "
+Imports System
+
+class C
+    sub M()
+        Console.WriteLine(1)
+        if (false)
+        end if
+        Console.WriteLine(1)
+    end sub
+end class
+")
+        End Function
+
+        <WpfFact>
+        Public Async Function TestVisualBasic_Formatting_Outside_Proposal() As Task
+            Await TestVisualBasic("
+class C
+    sub M()
+        [| Console  .  WriteLine ( 1 )  |]
+            if (    true    )
+            [| Console  .  WriteLine ( 1 )   |]
+            end if
+    end sub
+end class", "
+Imports System
+
+class C
+    sub M()
+        Console.WriteLine(1)
+        if (true)
+            Console.WriteLine(1)
+        end if
+    end sub
+end class")
+        End Function
+
+        <WpfFact>
+        Public Async Function TestVisualBasic_Partial_Formatting() As Task
+            Await TestVisualBasic("
+class C
+    sub M()
+        [| System .  Console  .  Writ|]
+    end sub
+end class", "
+class C
+    sub M()
+        System.Console.Writ
     end sub
 end class")
         End Function
