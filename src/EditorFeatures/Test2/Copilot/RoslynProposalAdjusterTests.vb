@@ -41,7 +41,7 @@ Namespace Microsoft.CodeAnalysis.Editor.UnitTests.Copilot
                     delta -= selectionSpan.Length
                 Next
 
-                Dim options = workspace.Services.SolutionServices.GetRequiredService(Of IGlobalOptionService)
+                Dim options = workspace.GetService(Of IGlobalOptionService)
                 options.SetGlobalOption(CopilotOptions.FixCodeFormat, True)
 
                 Dim service = workspace.Services.GetRequiredService(Of ICopilotProposalAdjusterService)
